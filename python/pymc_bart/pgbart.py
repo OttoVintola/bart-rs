@@ -166,6 +166,27 @@ class PGBART(ArrayStepShared):
             batch_post=batch[1],
         )
 
+        # child processes spawned with spawn need to be able
+        # to reconstruct numba/PySampler objects which are not
+        # cloudpickleable
+        self._model = model
+        self._vars = vars
+        # Store picklable settings parameters, not the Rust PyBartSettings object
+        self._settings_params = {
+            "n_trees": self.bart.m,
+            "n_particles": num_particles,
+            "max_depth": max_depth,
+            "alpha": self.bart.alpha,
+            "beta": self.bart.beta,
+            "sigma": sigma,
+            "split_prior": splitting_probs.tolist(),
+            "split_rules": split_rules,
+            "response_rule": self.bart.response,
+            "resampling_rule": "systematic",
+            "batch_tune": batch[0],
+            "batch_post": batch[1],
+        }
+
         # INFO: Only at the end do we return the State structure back to Python to avoid
         #       overhead. Otherwise, we would need to create create a PyState to wrap
         #       around to contain the PgBartState in order to return the results back to the user.
@@ -183,6 +204,35 @@ class PGBART(ArrayStepShared):
 
         self.tune = True
         super().__init__(vars, self.compiled_pymc_model.shared)
+
+    def __getstate__(self):
+        # Exclude unpicklable compiled objects (numba cfuncs, PySampler)
+        state = self.__dict__.copy()
+        for key in ("compiled_pymc_model", "pg_bart", "logp_fn_ptr"):
+            if key in state:
+                state[key] = None
+        return state
+
+    def __setstate__(self, state):
+        # Restore state and lazily rebuild compiled artifacts if needed
+        self.__dict__.update(state)
+        # Rebuild compiled objects in child processes where they were
+        # removed during pickling.
+        if getattr(self, "compiled_pymc_model", None) is None and getattr(self, "_model", None) is not None:
+            try:
+                self.compiled_pymc_model = CompiledPyMCModel(self._model, self._vars)
+                # Rebuild settings from stored parameters
+                settings = PyBartSettings(**self._settings_params)
+                # rebuild the PySampler using rebuilt settings
+                self.pg_bart = PySampler.init(
+                    x=np.asfortranarray(self.X),
+                    y=self.bart.Y,
+                    model=self.compiled_pymc_model.get_function_pointer(),
+                    settings=settings,
+                )
+            except Exception:
+                self.compiled_pymc_model = None
+                self.pg_bart = None
 
     def astep(self, _):
     #     # Record time to quantify performance improvements
